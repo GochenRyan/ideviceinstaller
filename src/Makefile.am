@@ -3,13 +3,15 @@ AM_CFLAGS =			\
 	$(libimobiledevice_CFLAGS)	\
 	$(libglib2_CFLAGS)	\
 	$(libplist_CFLAGS)	\
-	$(libzip_CFLAGS)
+	$(libzip_CFLAGS)	\
+	$(zlib_CFLAGS)
 
 AM_LDFLAGS =			\
 	$(libimobiledevice_LIBS)	\
 	$(libglib2_LIBS)	\
 	$(libplist_LIBS)	\
-	$(libzip_LIBS)
+	$(libzip_LIBS)		\
+	$(zlib_LIBS)
 
 bin_PROGRAMS = ideviceinstaller
 

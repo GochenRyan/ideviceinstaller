@@ -23,6 +23,7 @@ LT_INIT
 PKG_CHECK_MODULES(libimobiledevice, libimobiledevice-1.0 >= 1.3.0)
 PKG_CHECK_MODULES(libplist, libplist-2.0 >= 2.3.0)
 PKG_CHECK_MODULES(libzip, libzip >= 0.10)
+PKG_CHECK_MODULES(zlib, zlib >= 1.3.0)
 
 # Checks for header files.
 AC_CHECK_HEADERS([stdint.h stdlib.h string.h])
