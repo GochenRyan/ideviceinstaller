@@ -255,7 +255,6 @@ static void r_close_entry(ZipParser* zp)
         // Buffers for reading compressed data and writing decompressed data
         unsigned char in[BUFFER_SIZE];  // Input buffer for compressed data
         unsigned char out[BUFFER_SIZE]; // Output buffer for decompressed data
-        size_t read_size;
         z_stream strm;
         int ret = 0;
 
@@ -397,7 +396,7 @@ static int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
 				fprintf(stderr, "AFC write error!\n");
 				return 0;
 			} else if (bytes_written != bytes_read) {
-				fprintf(stderr, "Error: only wrote %u bytes, expected %u bytes\n", bytes_written, bytes_read);
+				fprintf(stderr, "Error: only wrote %u bytes, expected %llu bytes\n", bytes_written, bytes_read);
 				return 0;
 			}
 			total_written += bytes_written;
@@ -427,11 +426,11 @@ static int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
             strm.avail_in = fread(in, 1, sizeof(in), zp->fp);
             read_int_size = strm.avail_in;
             if (ferror(zp->fp)) break;
-            strm.next_in = in;
+            strm.next_in = (Bytef *)in;
 
             do {
                 strm.avail_out = sizeof(out_buf);
-                strm.next_out = out_buf;
+                strm.next_out = (Bytef *)out_buf;
                 ret = inflate(&strm, Z_NO_FLUSH);
 
                 if (ret == Z_STREAM_ERROR) break;
