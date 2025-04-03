@@ -183,7 +183,7 @@ typedef struct {
 } ZipParser;
 
 /* Open ZIP file and initialize parser */
-ZipParser* r_zip_open(const char* path) {
+static ZipParser* r_zip_open(const char* path) {
     FILE* fp = fopen(path, "rb");
     if (!fp) return NULL;
 
@@ -194,7 +194,7 @@ ZipParser* r_zip_open(const char* path) {
     return zp;
 }
 
-int r_zip_skip_until_next_entry(ZipParser* zp) {
+static int r_zip_skip_until_next_entry(ZipParser* zp) {
     uint32_t signature;
     size_t read_size;
     uint8_t buffer[BUFFER_SIZE];
@@ -235,7 +235,7 @@ int r_zip_skip_until_next_entry(ZipParser* zp) {
     }
 }
 
-void r_reset_entry(ZipParser* zp) {
+static void r_reset_entry(ZipParser* zp) {
     memset(zp->filename, 0, sizeof(zp->filename));
     zp->comp_size = 0;
     zp->uncomp_size = 0;
@@ -248,7 +248,7 @@ void r_reset_entry(ZipParser* zp) {
     zp->consumed = false;
 }
 
-void r_close_entry(ZipParser* zp)
+static void r_close_entry(ZipParser* zp)
 {
     if (zp->compression == COMPRESSION_DEFLATE)
     {
@@ -304,7 +304,7 @@ void r_close_entry(ZipParser* zp)
 }
 
 /* Get next entry in ZIP file */
-int r_zip_get_next_entry(ZipParser* zp) {
+static int r_zip_get_next_entry(ZipParser* zp) {
     if (zp->consumed == false && zp->header_start != -1)
     {
         r_close_entry(zp);
@@ -347,16 +347,17 @@ int r_zip_get_next_entry(ZipParser* zp) {
         zp->uncomp_size = lfh.uncompressed_size;
     }
 
-    if (zp->compression == COMPRESSION_STORE)
+    if (zp->compression == COMPRESSION_STORE && zp->flags == FLAG_DATA_DESCRIPTOR)
     {
-        assert(zp->flags != FLAG_DATA_DESCRIPTOR && "Store method, but exists data descriptor");
+		fprintf(stderr, "Store method, but exists data descriptor\n");
+		return 0;
     }
 
     return 1;
 }
 
 /* Close ZIP file and cleanup */
-void r_zip_close(ZipParser* zp) {
+static void r_zip_close(ZipParser* zp) {
     if (zp) {
         fclose(zp->fp);
         free(zp);
@@ -364,32 +365,47 @@ void r_zip_close(ZipParser* zp) {
 }
 
 /* Extract current entry to output path */
-int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
+static int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
     int result = 0;
     _fseeki64(zp->fp, zp->data_start, SEEK_SET);
 
     // Handle different compression methods
     if (zp->compression == COMPRESSION_STORE) {
-        // Simple store - just copy data
-		uint64_t written = 0;
-        char* buffer = malloc(zp->comp_size);
-        _fseeki64(zp->fp, zp->data_start, SEEK_SET);
-        fread(buffer, zp->comp_size, 1, zp->fp);
+        const uint32_t CHUNK_SIZE = 4096;
+		uint64_t total_written = 0;
+		uint32_t to_read = 0;
+		char buffer[CHUNK_SIZE];
 
-		if (afc_file_write(afc, af, buffer, zp->comp_size, &written) !=
-			AFC_E_SUCCESS) {
-			fprintf(stderr, "AFC Write error!\n");
-			free(buffer);
-			return 0;
-		} else if (written != zp->comp_size) {
-			fprintf(stderr, "Error: wrote only lu of %lu\n", written, zp->comp_size);
-			free(buffer);
-			return 0;
-		} else {
-        	zp->consumed = true;
-			free(buffer);
-			return 1;
+		// Set the file pointer to the data start position
+		_fseeki64(zp->fp, zp->data_start, SEEK_SET);
+
+		// Loop until all compressed data has been processed
+		while (total_written < zp->comp_size) {
+			// Determine how many bytes to read in this iteration
+			to_read = ((zp->comp_size - total_written) < CHUNK_SIZE) ? (zp->comp_size - total_written) : CHUNK_SIZE;
+
+			// Read data from file
+			size_t bytes_read = fread(buffer, 1, to_read, zp->fp);
+			if (bytes_read != to_read) {
+				fprintf(stderr, "File read error!\n");
+				return 0;
+			}
+
+			uint32_t bytes_written = 0;
+			// Write the data chunk to the AFC file
+			if (afc_file_write(afc, af, buffer, bytes_read, &bytes_written) != AFC_E_SUCCESS) {
+				fprintf(stderr, "AFC write error!\n");
+				return 0;
+			} else if (bytes_written != bytes_read) {
+				fprintf(stderr, "Error: only wrote %u bytes, expected %u bytes\n", bytes_written, bytes_read);
+				return 0;
+			}
+			total_written += bytes_written;
 		}
+
+		// Mark the compression process as consumed
+		zp->consumed = true;
+		return 1;
     } else if (zp->compression == COMPRESSION_DEFLATE) {
         // Use zlib for DEFLATE decompression
         _fseeki64(zp->fp, zp->data_start, SEEK_SET);
@@ -399,10 +415,10 @@ int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
         strm.opaque = Z_NULL;
         inflateInit2(&strm, -MAX_WBITS); // Negative for raw DEFLATE
 
-        uint8_t in[4096];
-        uint8_t out_buf[4096];
+        char in[4096];
+        char out_buf[4096];
         int ret;
-		size_t written = 0;
+		uint32_t written = 0;
 
         uint64_t total_in_size = 0;
         uint64_t read_int_size = 0;
@@ -420,13 +436,13 @@ int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
 
                 if (ret == Z_STREAM_ERROR) break;
 
-                size_t have = sizeof(out_buf) - strm.avail_out;
+                uint32_t have = sizeof(out_buf) - strm.avail_out;
                 if (afc_file_write(afc, af, out_buf, have, &written) !=
 					AFC_E_SUCCESS) {
 					fprintf(stderr, "AFC Write error!\n");
 					return 0;
 				} else if (written != have) {
-					fprintf(stderr, "Error: wrote only lu of %lu\n", written, have);
+					fprintf(stderr, "Error: wrote only %u of %u\n", written, have);
 					return 0;
 				}
             } while (strm.avail_out == 0);
@@ -1321,7 +1337,6 @@ run_again:
 		char *pkgname = NULL;
 		struct stat fst;
 		uint64_t af = 0;
-		char buf[8192];
 
 		lockdownd_service_descriptor_free(service);
 		service = NULL;
@@ -1364,6 +1379,8 @@ run_again:
 
 		/* open install package */
 		ZipParser *zp = NULL;
+		int errp = 0;
+		struct zip *zf = NULL;
 
 		if ((strlen(cmdarg) > 5) && (strcmp(&cmdarg[strlen(cmdarg)-5], ".ipcc") == 0)) {
 			zp = r_zip_open(cmdarg);
