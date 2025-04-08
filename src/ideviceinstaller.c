@@ -564,10 +564,11 @@ static int r_extract_to_buffer(ZipParser* zp, char** buffer, uint64_t *len) {
     return result;
 }
 
-static int r_get_content(ZipParser* zp, const char* file_name, char** buffer, uint64_t* len) {
+static int r_get_content(ZipParser* zp, const char* file_name, char** buffer, uint32_t* len) {
     *buffer = NULL;
     *len = 0;
-    reset_entry(zp);
+	uint64_t size = 0;
+    r_reset_entry(zp);
 
     size_t file_name_len = strlen(file_name);
 
@@ -578,16 +579,16 @@ static int r_get_content(ZipParser* zp, const char* file_name, char** buffer, ui
             if (!strncmp(name, file_name, file_name_len)) {
                 if (zp->uncomp_size != 0) {
                     if (zp->uncomp_size > 10485760) {
-						fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
+						fprintf(stderr, "ERROR: file '%s' is too large!\n", file_name);
                         r_reset_entry(zp);
                         return -1;
                     } else {
-                        r_extract_to_buffer(zp, buffer, len);
+                        r_extract_to_buffer(zp, buffer, &size);
                     }
                 } else {
-                    r_extract_to_buffer(zp, buffer, len);
-                    if (len > 10485760) {
-						fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
+                    r_extract_to_buffer(zp, buffer, &size);
+                    if (size > 10485760) {
+						fprintf(stderr, "ERROR: file '%s' is too large!\n", file_name);
                         r_reset_entry(zp);
                         return -1;
                     }
@@ -596,6 +597,8 @@ static int r_get_content(ZipParser* zp, const char* file_name, char** buffer, ui
             }
         }
     }
+
+	*len = (uint32_t)size;
 
     r_reset_entry(zp);
 
@@ -1470,7 +1473,6 @@ run_again:
 
 		/* open install package */
 		ZipParser *zp = NULL;
-		int errp = 0;
 
 		if ((strlen(cmdarg) > 5) && (strcmp(&cmdarg[strlen(cmdarg)-5], ".ipcc") == 0)) {
 			zp = r_zip_open(cmdarg);
