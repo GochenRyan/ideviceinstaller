@@ -461,6 +461,205 @@ static int r_extract_current(ZipParser* zp, afc_client_t afc, uint64_t af) {
     return result;
 }
 
+/* Extract current entry to buffer */
+static int r_extract_to_buffer(ZipParser* zp, char** buffer, uint64_t *len) {
+    if (!buffer) return 0;
+
+    *len = 0;
+
+    int result = 0;
+    _fseeki64(zp->fp, zp->data_start, SEEK_SET);
+
+    if (zp->compression == COMPRESSION_STORE) {
+        // Allocate memory for the uncompressed data
+        *buffer = malloc(zp->comp_size);
+        if (!*buffer) return 0;
+
+        // Read data directly into the buffer
+        fread(*buffer, zp->comp_size, 1, zp->fp);
+        if (ferror(zp->fp)) {
+            free(*buffer);
+            *buffer = NULL;
+            return 0;
+        }
+
+        *len = zp->comp_size;
+        result = 1;
+        zp->consumed = true;
+    }
+    else if (zp->compression == COMPRESSION_DEFLATE) {
+        // Use zlib for DEFLATE decompression
+        z_stream strm;
+        strm.zalloc = Z_NULL;
+        strm.zfree = Z_NULL;
+        strm.opaque = Z_NULL;
+        if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
+            return 0;
+        }
+
+        char in[4096];
+        char out_buf[4096];
+        uint64_t total_size = 0;
+        uint64_t alloc_size = 4096; // Initial buffer size
+
+        *buffer = malloc(alloc_size);
+        if (!*buffer) {
+            inflateEnd(&strm);
+            return 0;
+        }
+
+        int ret;
+        do {
+            strm.avail_in = fread(in, 1, sizeof(in), zp->fp);
+            if (ferror(zp->fp)) {
+                free(*buffer);
+                *buffer = NULL;
+                inflateEnd(&strm);
+                return 0;
+            }
+            strm.next_in = (Bytef*)in;
+
+            do {
+                strm.avail_out = sizeof(out_buf);
+                strm.next_out = (Bytef*)out_buf;
+                ret = inflate(&strm, Z_NO_FLUSH);
+
+                if (ret == Z_STREAM_ERROR) {
+                    free(*buffer);
+                    *buffer = NULL;
+                    inflateEnd(&strm);
+                    return 0;
+                }
+
+                size_t have = sizeof(out_buf) - strm.avail_out;
+                if (total_size + have > alloc_size) {
+                    alloc_size *= 2;
+                    *buffer = realloc(*buffer, alloc_size);
+                    if (!*buffer) {
+                        inflateEnd(&strm);
+                        return 0;
+                    }
+                }
+
+                memcpy(*buffer + total_size, out_buf, have);
+                total_size += have;
+            } while (strm.avail_out == 0);
+        } while (ret != Z_STREAM_END);
+
+        if (ret == Z_STREAM_END) {
+            // Adjust buffer size to match actual data size
+            *buffer = realloc(*buffer, total_size);
+            *len = total_size;
+            result = 1;
+        }
+        else {
+            free(*buffer);
+            *buffer = NULL;
+        }
+
+        inflateEnd(&strm);
+        zp->consumed = true;
+    }
+
+    return result;
+}
+
+static int r_get_content(ZipParser* zp, const char* file_name, char** buffer, uint64_t* len) {
+    *buffer = NULL;
+    *len = 0;
+    reset_entry(zp);
+
+    size_t file_name_len = strlen(file_name);
+
+    while (r_zip_get_next_entry(zp)) {
+        const char* name = zp->filename;
+
+        if (name != NULL) {
+            if (!strncmp(name, file_name, file_name_len)) {
+                if (zp->uncomp_size != 0) {
+                    if (zp->uncomp_size > 10485760) {
+						fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
+                        r_reset_entry(zp);
+                        return -1;
+                    } else {
+                        r_extract_to_buffer(zp, buffer, len);
+                    }
+                } else {
+                    r_extract_to_buffer(zp, buffer, len);
+                    if (len > 10485760) {
+						fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
+                        r_reset_entry(zp);
+                        return -1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    r_reset_entry(zp);
+
+    return 0;
+}
+
+static int r_get_app_directory(ZipParser* zp, char** path) {
+    int len = 0;
+
+    while (r_zip_get_next_entry(zp)) {
+        const char* name = zp->filename;
+        
+        if (name != NULL) {
+            /* check if we have a "Payload/.../" name */
+            len = strlen(name);
+            if (!strncmp(name, "Payload/", 8) && (len > 8)) {
+                /* skip hidden files */
+                if (name[8] == '.')
+                    continue;
+
+                /* locate the second directory delimiter */
+                const char* p = name + 8;
+                do {
+                    if (*p == '/') {
+                        break;
+                    }
+                } while (p++ != NULL);
+
+                /* try next entry if not found */
+                if (p == NULL)
+                    continue;
+
+                len = p - name + 1;
+
+                /* make sure app directory endwith .app */
+                if (len < 12 || strncmp(p - 4, ".app", 4))
+                {
+                    continue;
+                }
+
+                if (path != NULL) {
+                    free(*path);
+                    *path = NULL;
+                }
+
+                /* allocate and copy filename */
+                *path = (char*)malloc(len + 1);
+                strncpy(*path, name, len);
+
+                /* add terminating null character */
+                char* t = *path + len;
+                *t = '\0';
+                break;
+            }
+        }
+    }
+
+    if (*path == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static void print_apps_header()
 {
 	if (!return_attrs) {
@@ -603,113 +802,6 @@ static void status_cb(plist_t command, plist_t status, void *unused)
 	} else {
 		fprintf(stderr, "ERROR: %s was called with invalid arguments!\n", __func__);
 	}
-}
-
-static int zip_get_contents(struct zip *zf, const char *filename, int locate_flags, char **buffer, uint32_t *len)
-{
-	struct zip_stat zs;
-	struct zip_file *zfile;
-	int zindex = zip_name_locate(zf, filename, locate_flags);
-
-	*buffer = NULL;
-	*len = 0;
-
-	if (zindex < 0) {
-		return -1;
-	}
-
-	zip_stat_init(&zs);
-
-	if (zip_stat_index(zf, zindex, 0, &zs) != 0) {
-		fprintf(stderr, "ERROR: zip_stat_index '%s' failed!\n", filename);
-		return -2;
-	}
-
-	if (zs.size > 10485760) {
-		fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
-		return -3;
-	}
-
-	zfile = zip_fopen_index(zf, zindex, 0);
-	if (!zfile) {
-		fprintf(stderr, "ERROR: zip_fopen '%s' failed!\n", filename);
-		return -4;
-	}
-
-	*buffer = malloc(zs.size);
-	if (zs.size > LLONG_MAX || zip_fread(zfile, *buffer, zs.size) != (zip_int64_t)zs.size) {
-		fprintf(stderr, "ERROR: zip_fread %" PRIu64 " bytes from '%s'\n", (uint64_t)zs.size, filename);
-		free(*buffer);
-		*buffer = NULL;
-		zip_fclose(zfile);
-		return -5;
-	}
-	*len = zs.size;
-	zip_fclose(zfile);
-	return 0;
-}
-
-static int zip_get_app_directory(struct zip* zf, char** path)
-{
-	zip_int64_t i = 0;
-	zip_int64_t c = (zip_int64_t)zip_get_num_entries(zf, 0);
-	int len = 0;
-	const char* name = NULL;
-
-	/* look through all filenames in the archive */
-	do {
-		/* get filename at current index */
-		name = zip_get_name(zf, i++, 0);
-		if (name != NULL) {
-			/* check if we have a "Payload/.../" name */
-			len = strlen(name);
-			if (!strncmp(name, "Payload/", 8) && (len > 8)) {
-				/* skip hidden files */
-				if (name[8] == '.')
-					continue;
-
-				/* locate the second directory delimiter */
-				const char* p = name + 8;
-				do {
-					if (*p == '/') {
-						break;
-					}
-				} while(p++ != NULL);
-
-				/* try next entry if not found */
-				if (p == NULL)
-					continue;
-
-				len = p - name + 1;
-
-				/* make sure app directory endwith .app */
-				if (len < 12 || strncmp(p - 4, ".app", 4))
-				{
-					continue;
-				}
-
-				if (path != NULL) {
-					free(*path);
-					*path = NULL;
-				}
-
-				/* allocate and copy filename */
-				*path = (char*)malloc(len + 1);
-				strncpy(*path, name, len);
-
-				/* add terminating null character */
-				char* t = *path + len;
-				*t = '\0';
-				break;
-			}
-		}
-	} while(i < c);
-
-	if (*path == NULL) {
-		return -1;
-	}
-
-	return 0;
 }
 
 static void idevice_event_callback(const idevice_event_t* event, void* userdata)
@@ -1379,7 +1471,6 @@ run_again:
 		/* open install package */
 		ZipParser *zp = NULL;
 		int errp = 0;
-		struct zip *zf = NULL;
 
 		if ((strlen(cmdarg) > 5) && (strcmp(&cmdarg[strlen(cmdarg)-5], ".ipcc") == 0)) {
 			zp = r_zip_open(cmdarg);
@@ -1485,9 +1576,9 @@ run_again:
 			plist_free(info);
 			info = NULL;
 		} else {
-			zf = zip_open(cmdarg, 0, &errp);
-			if (!zf) {
-				fprintf(stderr, "ERROR: zip_open: %s: %d\n", cmdarg, errp);
+			zp = r_zip_open(cmdarg);
+			if (!zp) {
+				fprintf(stderr, "ERROR: r_zip_open: %s\n", cmdarg);
 				goto leave_cleanup;
 			}
 
@@ -1513,7 +1604,8 @@ run_again:
 
 			if (!meta && !meta_dict) {
 				/* extract iTunesMetadata.plist from package */
-				if (zip_get_contents(zf, ITUNES_METADATA_PLIST_FILENAME, 0, &zbuf, &len) == 0) {
+				
+				if (r_get_content(zp, ITUNES_METADATA_PLIST_FILENAME, &zbuf, &len) == 0) {
 					meta = plist_new_data(zbuf, len);
 					plist_from_memory(zbuf, len, &meta_dict, NULL);
 				}
@@ -1532,8 +1624,9 @@ run_again:
 			char* filename = NULL;
 			char* app_directory_name = NULL;
 
-			if (zip_get_app_directory(zf, &app_directory_name)) {
+			if (r_get_app_directory(zp, &app_directory_name) != 0) {
 				fprintf(stderr, "ERROR: Unable to locate .app directory in archive. Make sure it is inside a 'Payload' directory.\n");
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 
@@ -1544,11 +1637,10 @@ run_again:
 			app_directory_name = NULL;
 			strcat(filename, "Info.plist");
 
-			if (zip_get_contents(zf, filename, 0, &zbuf, &len) < 0) {
+			if (r_get_content(zp, filename, &zbuf, &len) < 0) {
 				fprintf(stderr, "WARNING: could not locate %s in archive!\n", filename);
 				free(filename);
-				zip_unchange_all(zf);
-				zip_close(zf);
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 			free(filename);
@@ -1557,8 +1649,7 @@ run_again:
 
 			if (!info) {
 				fprintf(stderr, "Could not parse Info.plist!\n");
-				zip_unchange_all(zf);
-				zip_close(zf);
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 
@@ -1578,8 +1669,7 @@ run_again:
 
 			if (!bundleexecutable) {
 				fprintf(stderr, "Could not determine value for CFBundleExecutable!\n");
-				zip_unchange_all(zf);
-				zip_close(zf);
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 
@@ -1599,6 +1689,7 @@ run_again:
 				char *sinfname = NULL;
 				if (asprintf(&sinfname, "Payload/%s.app/SC_Info/%s.sinf", bundleexecutable, bundleexecutable) < 0) {
 					fprintf(stderr, "Out of memory!?\n");
+					r_zip_close(zp);
 					goto leave_cleanup;
 				}
 				free(bundleexecutable);
@@ -1606,7 +1697,7 @@ run_again:
 				/* extract .sinf from package */
 				zbuf = NULL;
 				len = 0;
-				if (zip_get_contents(zf, sinfname, 0, &zbuf, &len) == 0) {
+				if (r_get_content(zp, sinfname, &zbuf, &len) == 0) {
 					sinf = plist_new_data(zbuf, len);
 				} else {
 					fprintf(stderr, "WARNING: could not locate %s in archive!\n", sinfname);
@@ -1619,6 +1710,7 @@ run_again:
 			pkgname = NULL;
 			if (asprintf(&pkgname, "%s/%s", PKG_PATH, bundleidentifier) < 0) {
 				fprintf(stderr, "Out of memory!?\n");
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 
@@ -1627,6 +1719,7 @@ run_again:
 			if (afc_upload_file(afc, cmdarg, pkgname) < 0) {
 				printf("FAILED\n");
 				free(pkgname);
+				r_zip_close(zp);
 				goto leave_cleanup;
 			}
 
@@ -1642,9 +1735,8 @@ run_again:
 				instproxy_client_options_add(client_opts, "iTunesMetadata", meta, NULL);
 			}
 		}
-		if (zf) {
-			zip_unchange_all(zf);
-			zip_close(zf);
+		if (zp) {
+			r_zip_close(zp);
 		}
 
 		/* perform installation or upgrade */
